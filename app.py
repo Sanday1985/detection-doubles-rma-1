@@ -1,76 +1,95 @@
+
 import streamlit as st
-import requests
 import pandas as pd
-from datetime import datetime
-from requests.auth import HTTPBasicAuth
+import requests
+import base64
+from collections import defaultdict
+from io import BytesIO
 
-st.set_page_config(page_title="Suivi des utilisateurs DHIS2", layout="wide")
+st.set_page_config(page_title="Détection des doubles attributions de RMA", layout="wide")
+st.title("🔍 Détection des Doubles Attributions de RMA")
 
-st.title("🔐 Connexion à DHIS2 et Analyse des Utilisateurs")
+# === Étape 1 : Saisie des identifiants DHIS2 ===
+st.sidebar.header("🔑 Connexion DHIS2")
+username = st.sidebar.text_input("Nom d'utilisateur", type="default")
+password = st.sidebar.text_input("Mot de passe", type="password")
 
-# --- Connexion à DHIS2
-dhis2_url = st.text_input("🌍 URL de l'instance DHIS2", "https://play.dhis2.org/40.0")
-username = st.text_input("👤 Nom d'utilisateur", type="default")
-password = st.text_input("🔑 Mot de passe", type="password")
+# === Étape 2 : Importer le fichier Excel des formations sanitaires ===
+st.header("📂 Importer le fichier contenant des formations sanitaires")
+uploaded_file = st.file_uploader("Choisissez le fichier fosa_services.xlsx", type=["xlsx"])
 
-if st.button("Se connecter"):
-    with st.spinner("Connexion à DHIS2..."):
-        response = requests.get(
-            f"{dhis2_url}/api/me",
-            auth=HTTPBasicAuth(username, password)
-        )
+if uploaded_file and username and password:
+    # Authentification DHIS2
+    auth_str = f"{username}:{password}"
+    auth_bytes = auth_str.encode("utf-8")
+    auth_b64 = base64.b64encode(auth_bytes).decode("utf-8")
+    headers = {"Authorization": f"Basic {auth_b64}"}
+
+    try:
+        df = pd.read_excel(uploaded_file)
+        st.success("✅ Fichier chargé avec succès.")
+
+        # Construire le mapping FOSA → [services]
+        fosa_to_services = defaultdict(set)
+        for _, row in df.iterrows():
+            fosa_to_services[row["FOSA ID"]].add(row["Service ID"])
+
+        # Requête vers DHIS2 pour récupérer les datasets
+        url = "https://togo.dhis2.org/dhis/api/dataSets.json"
+        params = {"paging": "false", "fields": "id,name,organisationUnits[id]"}
+        response = requests.get(url, headers=headers, params=params)
+
         if response.status_code == 200:
-            st.success("✅ Connexion réussie.")
-            user_info = response.json()
-            st.write("👤 Utilisateur :", user_info["displayName"])
+            data = response.json().get("dataSets", [])
+            doublons = []
+
+            for dataset in data:
+                dataset_id = dataset["id"]
+                dataset_name = dataset["name"]
+                ou_ids = [ou["id"] for ou in dataset.get("organisationUnits", [])]
+
+                for fosa_id, service_ids in fosa_to_services.items():
+                    attributs = set()
+                    if fosa_id in ou_ids:
+                        attributs.add("fosa")
+                    attrib_services = service_ids.intersection(ou_ids)
+                    if attrib_services:
+                        attributs.update(attrib_services)
+                    if len(attributs) > 1:
+                        doublons.append({
+                            "dataset_id": dataset_id,
+                            "dataset_name": dataset_name,
+                            "fosa_id": fosa_id,
+                            "attribué_à": list(attributs)
+                        })
+
+            df_doublons = pd.DataFrame(doublons)
+
+            if not df_doublons.empty:
+                df_doublons['service_id_extrait'] = df_doublons['attribué_à'].apply(lambda x: [elem for elem in x if elem != 'fosa'])
+                df_doublons['service_id_extrait_str'] = df_doublons['service_id_extrait'].apply(lambda x: ','.join(x) if isinstance(x, list) else x)
+                doublons_services = df_doublons.groupby(['dataset_id', 'fosa_id'])['service_id_extrait_str'].apply(lambda x: len(set(','.join(x).split(','))) > 1).reset_index(name='doublon_detecté')
+                doublons_detectés = doublons_services[doublons_services['doublon_detecté'] == True]
+
+                st.success(f"✅ {len(doublons_detectés)} doublon(s) détecté(s).")
+                st.dataframe(df_doublons)
+
+                # Télécharger le fichier CSV
+                csv_buffer = BytesIO()
+                doublons_detectés.to_csv(csv_buffer, index=False)
+                st.download_button(
+                    label="📥 Télécharger les doublons détectés (CSV)",
+                    data=csv_buffer.getvalue(),
+                    file_name="doublons_detectés.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("Aucun doublon détecté.")
+
         else:
-            st.error("❌ Échec de la connexion. Vérifiez les identifiants.")
-            st.stop()
+            st.error("Erreur lors de la récupération des datasets depuis DHIS2. Vérifiez vos identifiants.")
 
-    # --- Récupération des utilisateurs
-    st.subheader("👥 Récupération des utilisateurs...")
-    users_url = f"{dhis2_url}/api/users?fields=id,name,created,userCredentials[username],organisationUnits[id,name]&paging=false"
-    res_users = requests.get(users_url, auth=HTTPBasicAuth(username, password))
-    users = res_users.json()["users"]
-
-    data = []
-    for user in users:
-        org_units = [ou["name"] for ou in user.get("organisationUnits", [])]
-        data.append({
-            "Nom complet": user.get("name", ""),
-            "Nom d'utilisateur": user.get("userCredentials", {}).get("username", ""),
-            "Date de création": user.get("created", ""),
-            "Unités d'organisation": ", ".join(org_units)
-        })
-
-    df = pd.DataFrame(data)
-
-    # Convertir la date de création en datetime
-    df["Date de création"] = pd.to_datetime(df["Date de création"])
-
-    # --- Détection des doublons
-    st.subheader("🔍 Doublons (par nom)")
-    dupes = df[df.duplicated("Nom complet", keep=False)]
-    st.dataframe(dupes)
-
-    # --- Dernière activité (commande)
-    st.subheader("📦 Dernière commande enregistrée")
-
-    # Exemple : extraire dernière activité via `dataValueSets` (à adapter selon ton instance)
-    # On prend la date du dernier formulaire soumis par utilisateur fictif
-    def get_days_since_last_submission(user_name):
-        return pd.Timestamp.now() - pd.Timestamp("2024-12-01")  # valeur fictive
-
-    df["Jours depuis dernière activité"] = df["Nom d'utilisateur"].apply(
-        lambda x: get_days_since_last_submission(x).days
-    )
-
-    st.dataframe(df)
-
-    # --- Export CSV
-    st.download_button(
-        label="⬇️ Télécharger CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="utilisateurs_dhis2.csv",
-        mime="text/csv"
-    )
+    except Exception as e:
+        st.error(f"Erreur lors du traitement : {e}")
+else:
+    st.info("Veuillez importer un fichier Excel et entrer vos identifiants DHIS2.")
